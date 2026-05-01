@@ -55,6 +55,7 @@ pub enum AuthError {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[allow(dead_code)]
 struct ClientRegistrationResponse {
     client_id: String,
     client_secret: Option<String>,

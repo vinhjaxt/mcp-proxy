@@ -13,7 +13,10 @@ use rmcp_proxy::{
         StdioServerParameters as StreamableStdioServerParameters, StreamableHttpServerSettings,
     },
 };
-use std::{collections::HashMap, env, error::Error, net::SocketAddr, process, time::Duration};
+use std::{
+    collections::HashMap, env, error::Error, net::SocketAddr, path::PathBuf, process,
+    time::Duration,
+};
 use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -36,7 +39,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
         mcp-proxy --port 8080 --host 0.0.0.0 -- npx -y @modelcontextprotocol/server-everything\n\n  \
         Expose a local stdio server as a Streamable HTTP server:\n  \
         mcp-proxy your-command --port 8080 --transport streamable-http\n  \
-        mcp-proxy --port 8080 --transport streamable-http -- python mcp_server.py
+        mcp-proxy --port 8080 --transport streamable-http -- python mcp_server.py\n\n  \
+        Listen on a Unix domain socket:\n  \
+        mcp-proxy --unix-socket /tmp/mcp.sock -- python mcp_server.py\n  \
+        mcp-proxy --unix-socket /tmp/mcp.sock --transport streamable-http -- python mcp_server.py
 ",
 )]
 struct Cli {
@@ -72,6 +78,15 @@ struct Cli {
     /// Transport type to use. Options: sse, streamable-http
     #[arg(long = "transport", default_value = "auto")]
     transport: String,
+
+    /// Path to a Unix domain socket to listen on (server mode only).
+    /// When set, --host and --port are ignored.
+    #[arg(long = "unix-socket")]
+    unix_socket: Option<PathBuf>,
+
+    /// File permissions for the Unix socket (octal, e.g. 0o600). Requires --unix-socket.
+    #[arg(long = "unix-socket-mode")]
+    unix_socket_mode: Option<String>,
 }
 
 #[tokio::main]
@@ -83,6 +98,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let mut cli = Cli::parse();
+
+    let unix_socket_mode = match cli.unix_socket_mode.as_deref() {
+        Some(s) => Some(
+            u32::from_str_radix(s.trim_start_matches("0o"), 8)
+                .map_err(|_| "invalid octal mode for --unix-socket-mode")?,
+        ),
+        None => None,
+    };
 
     // Check if we have a command or URL, or use the first of the pased args
     let command_or_url = match cli.command_or_url {
@@ -194,6 +217,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let sse_settings = SseServerSettings {
                     bind_addr: format!("{}:{}", cli.sse_host, cli.sse_port)
                         .parse::<SocketAddr>()?,
+                    unix_socket: cli.unix_socket.clone(),
+                    unix_socket_mode,
                     keep_alive: Some(Duration::from_secs(15)),
                 };
 
@@ -214,6 +239,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let streamable_settings = StreamableHttpServerSettings {
                     bind_addr: format!("{}:{}", cli.sse_host, cli.sse_port)
                         .parse::<SocketAddr>()?,
+                    unix_socket: cli.unix_socket.clone(),
+                    unix_socket_mode,
                     keep_alive: Some(Duration::from_secs(15)),
                 };
 

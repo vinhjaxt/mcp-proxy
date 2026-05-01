@@ -10,7 +10,8 @@ use rmcp::{
     ServiceExt,
 };
 use std::{
-    collections::HashMap, error::Error as StdError, net::SocketAddr, sync::Arc, time::Duration,
+    collections::HashMap, error::Error as StdError, net::SocketAddr, os::unix::fs::PermissionsExt,
+    path::PathBuf, sync::Arc, time::Duration,
 };
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +31,8 @@ pub struct StdioServerParameters {
 #[derive(Debug, Clone)]
 pub struct StreamableHttpServerSettings {
     pub bind_addr: SocketAddr,
+    pub unix_socket: Option<PathBuf>,
+    pub unix_socket_mode: Option<u32>,
     pub keep_alive: Option<Duration>,
 }
 
@@ -109,22 +112,37 @@ pub async fn run_streamable_http_server(
         )
         .fallback_service(streamable_service);
 
-    let listener = tokio::net::TcpListener::bind(&settings.bind_addr).await?;
-    let actual_addr = listener.local_addr()?;
-
-    info!("Streamable HTTP server listening on http://{}", actual_addr);
-
-    let serve_future =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(shutdown_token.clone()));
-
-    tokio::select! {
-        result = serve_future => {
-            if let Err(e) = result {
-                warn!("Server error: {}", e);
-            }
+    if let Some(ref socket_path) = settings.unix_socket {
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path)?;
         }
-        _ = shutdown_token.cancelled() => {
-            info!("Shutdown token cancelled");
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
+        if let Some(mode) = settings.unix_socket_mode {
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(mode))?;
+        }
+        info!(
+            "Streamable HTTP server listening on unix://{}",
+            socket_path.display()
+        );
+        let socket_path_clone = socket_path.clone();
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal_with_cleanup(
+                shutdown_token.clone(),
+                Some(socket_path_clone),
+            ))
+            .await;
+        if let Err(e) = result {
+            warn!("Server error: {}", e);
+        }
+    } else {
+        let listener = tokio::net::TcpListener::bind(&settings.bind_addr).await?;
+        let actual_addr = listener.local_addr()?;
+        info!("Streamable HTTP server listening on http://{}", actual_addr);
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal(shutdown_token.clone()))
+            .await;
+        if let Err(e) = result {
+            warn!("Server error: {}", e);
         }
     }
 
@@ -136,6 +154,17 @@ pub async fn run_streamable_http_server(
 
     info!("Shutdown complete");
     Ok(())
+}
+
+async fn shutdown_signal_with_cleanup(
+    shutdown_token: CancellationToken,
+    socket_path: Option<PathBuf>,
+) {
+    shutdown_signal(shutdown_token).await;
+    if let Some(path) = socket_path {
+        let _ = std::fs::remove_file(&path);
+        info!("Cleaned up unix socket: {}", path.display());
+    }
 }
 
 async fn shutdown_signal(shutdown_token: CancellationToken) {

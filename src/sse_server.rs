@@ -10,7 +10,10 @@ use rmcp::{
     },
     ServiceExt,
 };
-use std::{collections::HashMap, error::Error as StdError, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap, error::Error as StdError, net::SocketAddr, os::unix::fs::PermissionsExt,
+    path::PathBuf, time::Duration,
+};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -18,6 +21,8 @@ use tracing::info;
 /// Settings for the SSE server
 pub struct SseServerSettings {
     pub bind_addr: SocketAddr,
+    pub unix_socket: Option<PathBuf>,
+    pub unix_socket_mode: Option<u32>,
     pub keep_alive: Option<Duration>,
 }
 
@@ -37,7 +42,12 @@ pub async fn run_sse_server(
 ) -> Result<(), Box<dyn StdError>> {
     info!(
         "Running SSE server on {:?} with command: {}",
-        sse_settings.bind_addr, stdio_params.command,
+        sse_settings
+            .unix_socket
+            .as_ref()
+            .map(|p| format!("unix://{}", p.display()))
+            .unwrap_or_else(|| sse_settings.bind_addr.to_string()),
+        stdio_params.command,
     );
 
     // Configure SSE server
@@ -81,15 +91,42 @@ pub async fn run_sse_server(
     // Create proxy handler
     let proxy_handler = ProxyHandler::new(client);
 
-    // Start the SSE server
-    let sse_server = SseServer::serve_with_config(config.clone()).await?;
+    // Use SseServer::new() to get the Router without binding, so we can
+    // serve it on our own listener (TCP or Unix socket).
+    let (sse_server, router) = SseServer::new(config.clone());
 
-    // Register the proxy handler with the SSE server
     let ct = sse_server.with_service(move || proxy_handler.clone());
 
-    // Wait for Ctrl+C to shut down
-    tokio::signal::ctrl_c().await?;
-    ct.cancel();
+    let socket_path = sse_settings.unix_socket.clone();
+
+    if let Some(ref socket_path) = socket_path {
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path)?;
+        }
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
+        if let Some(mode) = sse_settings.unix_socket_mode {
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(mode))?;
+        }
+        info!(
+            "SSE server listening on unix://{}",
+            socket_path.display()
+        );
+        let socket_path = socket_path.clone();
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                ct.cancelled().await;
+                let _ = std::fs::remove_file(&socket_path);
+            })
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+        info!("SSE server listening on http://{}", config.bind);
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                ct.cancelled().await;
+            })
+            .await?;
+    }
 
     Ok(())
 }

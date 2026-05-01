@@ -1,5 +1,5 @@
 use dirs::home_dir;
-use log::{debug, error};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
