@@ -12,8 +12,7 @@ use rmcp::{
     transport::{async_rw::AsyncRwTransport, stdio},
     ServiceExt,
 };
-use serde_json::Value;
-use std::{collections::HashMap, error::Error as StdError, sync::Arc};
+use std::{collections::HashMap, error::Error as StdError, pin::Pin, sync::Arc, task::Context};
 use tokio::io::AsyncWrite;
 use tokio_util::io::StreamReader;
 use tracing::{error, info, warn};
@@ -31,43 +30,78 @@ pub struct SseClientConfig {
     pub headers: HashMap<String, String>,
 }
 
-/// SSE Writer implementation for outgoing messages
-/// TODO: remove in the next major version since SSE is deprecated
+const SSE_WRITE_CHANNEL_CAPACITY: usize = 256;
+
+/// SSE Writer implementation for outgoing messages.
+/// Uses a bounded channel + single sender task for backpressure.
 struct SseWriter {
-    client: HttpClient,
-    message_url: String,
+    tx: tokio::sync::mpsc::Sender<String>,
+}
+
+impl SseWriter {
+    fn new(client: HttpClient, message_url: String, auth_header: Option<String>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(SSE_WRITE_CHANNEL_CAPACITY);
+
+        tokio::spawn(async move {
+            while let Some(body) = rx.recv().await {
+                if body.is_empty() {
+                    continue;
+                }
+                let mut req = client
+                    .post(&message_url)
+                    .header("Content-Type", "application/json");
+
+                if let Some(ref auth) = auth_header {
+                    req = req.header("Authorization", auth);
+                }
+
+                match req.body(body).send().await {
+                    Ok(response) => {
+                        if !response.status().is_success() {
+                            warn!("Message POST failed with status: {}", response.status());
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to send message: {}", e);
+                    }
+                }
+            }
+        });
+
+        Self { tx }
+    }
 }
 
 impl AsyncWrite for SseWriter {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        if let Ok(json_str) = std::str::from_utf8(buf) {
-            let lines: Vec<&str> = json_str.lines().collect();
-            for line in lines {
-                if !line.trim().is_empty() {
-                    if let Ok(json_value) = serde_json::from_str::<Value>(line) {
-                        let client = self.client.clone();
-                        let url = self.message_url.clone();
+        let json_str = std::str::from_utf8(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-                        tokio::spawn(async move {
-                            match client.post(&url).json(&json_value).send().await {
-                                Ok(response) => {
-                                    if !response.status().is_success() {
-                                        warn!(
-                                            "Message POST failed with status: {}",
-                                            response.status()
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to send message: {}", e);
-                                }
-                            }
-                        });
-                    }
+        for line in json_str.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let _: serde::de::IgnoredAny = serde_json::from_str(trimmed)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+            match self.tx.try_send(trimmed.to_owned()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Channel full — upstream server is slow. Drop this message
+                    // to avoid blocking the proxy. With a 256-slot channel this
+                    // should only happen under extreme backpressure.
+                    warn!("SSE write channel full, dropping message");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "send channel closed",
+                    )));
                 }
             }
         }
@@ -76,16 +110,17 @@ impl AsyncWrite for SseWriter {
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
+        // Channel closes when SseWriter is dropped, ending the sender task.
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -96,11 +131,24 @@ impl AsyncWrite for SseWriter {
 pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdError>> {
     info!("Running SSE client with URL: {}", config.url);
 
-    let http_client = HttpClient::builder()
-        .timeout(std::time::Duration::from_secs(30))
+    // Build headers from CLI args first
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in config.headers {
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
+            reqwest::header::HeaderValue::from_str(&value)?,
+        );
+    }
+
+    let client = HttpClient::builder()
+        .timeout(crate::utils::HTTP_TIMEOUT)
+        .connect_timeout(crate::utils::HTTP_CONNECT_TIMEOUT)
+        .pool_idle_timeout(crate::utils::HTTP_POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(crate::utils::HTTP_TCP_KEEPALIVE)
+        .default_headers(headers)
         .build()?;
 
-    let req = http_client.get(&config.url).send().await?;
+    let req = client.get(&config.url).send().await?;
     let auth_config = match req.status() {
         reqwest::StatusCode::OK => {
             info!("No authentication required");
@@ -111,7 +159,6 @@ pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdEr
 
             let auth_client = Arc::new(AuthClient::new(config.url.clone(), DEFAULT_CALLBACK_PORT)?);
             let server_url_hash = auth_client.get_server_url_hash().to_string();
-            // Coordinate auth with other processes
             let auth_result = coordination::coordinate_auth(
                 &server_url_hash,
                 auth_client.clone(),
@@ -120,7 +167,6 @@ pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdEr
             )
             .await?;
 
-            // Get auth config
             let auth_config = match auth_result {
                 AuthCoordinationResult::HandleAuth { auth_url } => {
                     info!("Opening browser for authentication. If it doesn't open automatically, please visit this URL:");
@@ -146,28 +192,13 @@ pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdEr
         }
     };
 
-    // Create the header map for authenticated requests
-    let mut headers = reqwest::header::HeaderMap::new();
-    for (key, value) in config.headers {
-        headers.insert(
-            reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
-            reqwest::header::HeaderValue::from_str(&value)?,
-        );
+    // Build auth header for SSE requests
+    let auth_header: Option<String> = auth_config.as_ref().and_then(|ac| {
+        ac.access_token.as_ref().map(|token| format!("Bearer {}", token))
+    });
+    if auth_config.is_some() && auth_header.is_none() {
+        return Err("Access token is empty".into());
     }
-
-    if let Some(auth_config) = auth_config {
-        if auth_config.access_token.is_none() {
-            return Err("Access token is empty".into());
-        }
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", auth_config.access_token.as_ref().unwrap()).parse()?,
-        );
-    }
-
-    let client = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?;
 
     // Parse URL to get base URL and endpoints
     let base_url = config.url.trim_end_matches("/sse");
@@ -178,12 +209,16 @@ pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdEr
     info!("Message endpoint: {}", message_url);
 
     // Create SSE stream
-    let response = client
+    let mut request = client
         .get(&sse_url)
         .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .send()
-        .await?;
+        .header("Cache-Control", "no-cache");
+
+    if let Some(ref auth) = auth_header {
+        request = request.header("Authorization", auth);
+    }
+
+    let response = request.send().await?;
 
     if !response.status().is_success() {
         return Err(format!("SSE connection failed with status: {}", response.status()).into());
@@ -211,10 +246,7 @@ pub async fn run_sse_client(config: SseClientConfig) -> Result<(), Box<dyn StdEr
     let reader = StreamReader::new(sse_stream);
 
     // Create writer for outgoing messages
-    let writer = SseWriter {
-        client: client.clone(),
-        message_url,
-    };
+    let writer = SseWriter::new(client.clone(), message_url, auth_header);
 
     // Create transport using AsyncRwTransport
     let transport = AsyncRwTransport::new(reader, writer);

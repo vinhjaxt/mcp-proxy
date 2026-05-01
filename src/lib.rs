@@ -15,7 +15,7 @@ pub mod sse_client;
 pub mod sse_server;
 pub mod streamable_http_client;
 pub mod streamable_http_server;
-mod utils;
+pub mod utils;
 
 // Export main functions
 pub use self::sse_client::run_sse_client;

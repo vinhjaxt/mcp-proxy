@@ -64,6 +64,8 @@ pub async fn run_streamable_http_server(
 
                 // Create child process
                 let tokio_process = TokioChildProcess::new(command)?;
+                let (read, write) = tokio_process.split();
+                let read = tokio::io::BufReader::with_capacity(8192, read);
 
                 let client_info = ClientInfo {
                     protocol_version: Default::default(),
@@ -75,7 +77,7 @@ pub async fn run_streamable_http_server(
                 let client = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         let client = client_info
-                            .serve(tokio_process)
+                            .serve((read, write))
                             .await
                             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 

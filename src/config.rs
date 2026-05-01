@@ -108,8 +108,12 @@ impl ConfigManager {
         debug!("Saving auth config to {:?}", config_path);
 
         let json = serde_json::to_string_pretty(config)?;
-        let mut file = File::create(config_path)?;
-        file.write_all(json.as_bytes())?;
+        let temp_path = config_path.with_extension("tmp");
+        {
+            let mut file = File::create(&temp_path)?;
+            file.write_all(json.as_bytes())?;
+        }
+        std::fs::rename(&temp_path, &config_path)?;
 
         Ok(())
     }
@@ -200,12 +204,16 @@ pub fn get_config_dir() -> PathBuf {
 fn is_process_running(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        use std::process::Command;
-        let output = Command::new("ps").arg("-p").arg(pid.to_string()).output();
-
-        match output {
-            Ok(output) => output.status.success(),
-            Err(_) => false,
+        // kill(pid, 0) doesn't send a signal, just checks existence+permission.
+        // Returns 0 if the process exists, -1 otherwise.
+        unsafe {
+            let ret = libc::kill(pid as i32, 0);
+            if ret == 0 {
+                true
+            } else {
+                // EPERM means the process exists but we lack permission to signal it
+                *libc::__errno_location() == libc::EPERM
+            }
         }
     }
 
@@ -228,11 +236,5 @@ fn is_process_running(pid: u32) -> bool {
 }
 
 fn is_lock_expired(lock: &LockFile) -> bool {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Lock expires after 10 minutes
-    now > lock.created_at + 600
+    crate::utils::is_lock_expired(lock)
 }

@@ -42,7 +42,15 @@ impl AuthenticatedHttpClient {
             return Ok(false);
         };
 
-        let current_config = auth_client.get_auth_config().await?;
+        let config_manager = crate::config::ConfigManager::new();
+        let current_config = match config_manager
+            .load_auth_config(auth_client.get_server_url_hash())
+        {
+            Ok(c) => c,
+            Err(crate::config::ConfigError::NotFound) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+
         match auth_client.refresh_token(&current_config).await {
             Ok(refreshed_config) => {
                 let new_token = refreshed_config.access_token.unwrap_or_default();
@@ -66,11 +74,23 @@ impl AuthenticatedHttpClient {
 
         let server_url_hash = auth_client.get_server_url_hash().to_string();
         let config_manager = crate::config::ConfigManager::new();
+
+        // Clear auth config
         let auth_path = config_manager.get_auth_config_path(&server_url_hash);
         if auth_path.exists() {
             std::fs::remove_file(&auth_path).ok();
             tracing::info!("Cleared invalid auth config");
         }
+
+        // Clear client registration file
+        let registration_path = config_manager.get_registration_path(&server_url_hash);
+        if registration_path.exists() {
+            std::fs::remove_file(&registration_path).ok();
+            tracing::info!("Cleared client registration");
+        }
+
+        // Clear in-memory caches
+        auth_client.clear_caches();
 
         let auth_result = crate::coordination::coordinate_auth(
             &server_url_hash,
@@ -222,9 +242,23 @@ impl StreamableHttpClient for AuthenticatedHttpClient {
         _auth_header: Option<String>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         let auth_token = self.get_auth_token().await;
-        self.client
-            .delete_session(uri, session_id, auth_token)
+        match self
+            .client
+            .delete_session(uri.clone(), session_id.clone(), auth_token)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if matches!(self.handle_auth_error(&error, false).await, Ok(true)) {
+                    let new_token = self.get_auth_token().await;
+                    self.client
+                        .delete_session(uri, session_id, new_token)
+                        .await
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     async fn get_stream(
@@ -238,9 +272,28 @@ impl StreamableHttpClient for AuthenticatedHttpClient {
         StreamableHttpError<Self::Error>,
     > {
         let auth_token = self.get_auth_token().await;
-        self.client
-            .get_stream(uri, session_id, last_event_id, auth_token)
+        match self
+            .client
+            .get_stream(
+                uri.clone(),
+                session_id.clone(),
+                last_event_id.clone(),
+                auth_token,
+            )
             .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                if matches!(self.handle_auth_error(&error, false).await, Ok(true)) {
+                    let new_token = self.get_auth_token().await;
+                    self.client
+                        .get_stream(uri, session_id, last_event_id, new_token)
+                        .await
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 }
 
@@ -249,11 +302,23 @@ pub async fn run_streamable_http_client(
 ) -> Result<(), Box<dyn StdError>> {
     info!("Running Streamable HTTP client with URL: {}", config.url);
 
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (key, value) in config.headers {
+        headers.insert(
+            reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
+            reqwest::header::HeaderValue::from_str(&value)?,
+        );
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(crate::utils::HTTP_TIMEOUT)
+        .connect_timeout(crate::utils::HTTP_CONNECT_TIMEOUT)
+        .pool_idle_timeout(crate::utils::HTTP_POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(crate::utils::HTTP_TCP_KEEPALIVE)
+        .default_headers(headers)
         .build()?;
 
-    let req = http_client.get(&config.url).send().await?;
+    let req = client.get(&config.url).send().await?;
     let (auth_config, auth_client) = match req.status() {
         reqwest::StatusCode::OK => {
             info!("No authentication required");
@@ -295,18 +360,6 @@ pub async fn run_streamable_http_client(
         }
     };
 
-    let mut headers = reqwest::header::HeaderMap::new();
-    for (key, value) in config.headers {
-        headers.insert(
-            reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
-            reqwest::header::HeaderValue::from_str(&value)?,
-        );
-    }
-
-    let base_client = reqwest::Client::builder()
-        .default_headers(headers)
-        .build()?;
-
     info!("Connecting to Streamable HTTP endpoint: {}", config.url);
 
     // Create transport config
@@ -345,7 +398,7 @@ pub async fn run_streamable_http_client(
         None => String::new(),
     };
     let authenticated_client = AuthenticatedHttpClient {
-        client: base_client,
+        client,
         auth_token: Arc::new(tokio::sync::RwLock::new(auth_token)),
         auth_client,
     };

@@ -68,18 +68,19 @@ pub async fn run_sse_server(
 
     // Create child process
     let tokio_process = TokioChildProcess::new(command)?;
+    let (read, write) = tokio_process.split();
+    let read = tokio::io::BufReader::with_capacity(8192, read);
 
     let client_info = ClientInfo {
         protocol_version: Default::default(),
         capabilities: ClientCapabilities::builder()
-            // Use minimal capabilities to avoid validation errors
             .enable_sampling()
             .build(),
         ..Default::default()
     };
 
     // Create client service
-    let client = client_info.serve(tokio_process).await?;
+    let client = client_info.serve((read, write)).await?;
 
     // Get server info
     let server_info = client.peer_info();
@@ -114,7 +115,8 @@ pub async fn run_sse_server(
         let socket_path = socket_path.clone();
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
-                ct.cancelled().await;
+                wait_for_shutdown_signal().await;
+                ct.cancel();
                 let _ = std::fs::remove_file(&socket_path);
             })
             .await?;
@@ -123,10 +125,40 @@ pub async fn run_sse_server(
         info!("SSE server listening on http://{}", config.bind);
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
-                ct.cancelled().await;
+                wait_for_shutdown_signal().await;
+                ct.cancel();
             })
             .await?;
     }
 
+    info!("Shutdown complete");
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C, initiating shutdown...");
+        },
+        _ = terminate => {
+            info!("Received terminate signal, initiating shutdown...");
+        },
+    }
 }

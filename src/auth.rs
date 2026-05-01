@@ -2,9 +2,9 @@ use crate::config::{AuthConfig, ConfigError, ConfigManager};
 use log::{debug, error};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
 
@@ -87,7 +87,10 @@ impl AuthClient {
         let server_url_hash = crate::utils::hash_server_url(&server_url);
 
         let http_client = HttpClient::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(crate::utils::HTTP_TIMEOUT)
+            .connect_timeout(crate::utils::HTTP_CONNECT_TIMEOUT)
+            .pool_idle_timeout(crate::utils::HTTP_POOL_IDLE_TIMEOUT)
+            .tcp_keepalive(crate::utils::HTTP_TCP_KEEPALIVE)
             .build()?;
 
         let session_id = Uuid::new_v4().to_string();
@@ -96,7 +99,7 @@ impl AuthClient {
         let oidc_config_cache = RwLock::new(OidcConfigCache {
             config: None,
             last_updated: None,
-            ttl: Duration::from_secs(3600), // 1 hour
+            ttl: crate::utils::OIDC_CACHE_TTL, // 1 hour
         });
 
         Ok(Self {
@@ -114,7 +117,7 @@ impl AuthClient {
 
     /// Load client registration from config or register a new client
     async fn ensure_client_registration(&self) -> Result<ClientRegistration> {
-        if let Some(registration) = self.client_registration.read().await.clone() {
+        if let Some(registration) = self.client_registration.read().unwrap().clone() {
             return Ok(registration);
         }
 
@@ -128,7 +131,7 @@ impl AuthClient {
                     match serde_json::from_str::<ClientRegistration>(&json) {
                         Ok(registration) => {
                             // Store in cache
-                            *self.client_registration.write().await = Some(registration.clone());
+                            *self.client_registration.write().unwrap() = Some(registration.clone());
                             return Ok(registration);
                         }
                         Err(e) => {
@@ -200,7 +203,7 @@ impl AuthClient {
 
         // Store in cache
         {
-            let mut reg = self.client_registration.write().await;
+            let mut reg = self.client_registration.write().unwrap();
             *reg = Some(registration.clone());
         }
 
@@ -211,6 +214,15 @@ impl AuthClient {
         &self.server_url_hash
     }
 
+    pub fn clear_caches(&self) {
+        *self.client_registration.write().unwrap() = None;
+        *self.oidc_config_cache.write().unwrap() = OidcConfigCache {
+            config: None,
+            last_updated: None,
+            ttl: crate::utils::OIDC_CACHE_TTL,
+        };
+    }
+
     pub fn get_redirect_url(&self) -> String {
         format!("http://127.0.0.1:{}/oauth/callback", self.redirect_port)
     }
@@ -218,7 +230,7 @@ impl AuthClient {
     async fn discover_openid_config(&self) -> Result<serde_json::Value> {
         // Check if we have a cached and valid configuration
         {
-            let cache = self.oidc_config_cache.read().await;
+            let cache = self.oidc_config_cache.read().unwrap();
             if let (Some(config), Some(last_updated)) = (&cache.config, cache.last_updated) {
                 let now = SystemTime::now();
                 if now
@@ -298,7 +310,7 @@ impl AuthClient {
 
         // Update the cache
         {
-            let mut cache = self.oidc_config_cache.write().await;
+            let mut cache = self.oidc_config_cache.write().unwrap();
             cache.config = Some(config.clone());
             cache.last_updated = Some(SystemTime::now());
         }
@@ -312,7 +324,7 @@ impl AuthClient {
         // Random state for CSRF
         let state = Uuid::new_v4().to_string();
 
-        *self.auth_state.write().await = Some(state.clone());
+        *self.auth_state.write().unwrap() = Some(state.clone());
 
         let redirect_url = self.get_redirect_url();
 
@@ -363,7 +375,7 @@ impl AuthClient {
         debug!("Handling OAuth callback with code");
 
         // Check if the state matches our stored state
-        let stored_state = self.auth_state.read().await.clone();
+        let stored_state = self.auth_state.read().unwrap().clone();
         if stored_state.is_none() || stored_state.unwrap() != state {
             return Err(AuthError::Other(
                 "State mismatch, possible CSRF attack".to_string(),
@@ -565,7 +577,9 @@ impl AuthClient {
         let new_config = AuthConfig {
             server_url: self.server_url.clone(),
             access_token: token_data.access_token,
-            refresh_token: token_data.refresh_token,
+            refresh_token: token_data
+                .refresh_token
+                .or_else(|| config.refresh_token.clone()),
             expires_at,
             auth_state: None,
             session_id: self.session_id.clone(),

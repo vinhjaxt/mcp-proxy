@@ -54,6 +54,7 @@ log = "0.4.27"
 dirs = "6.0.0"
 env_logger = "0.11.8"
 open = "5.0"
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"

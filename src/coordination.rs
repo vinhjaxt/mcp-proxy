@@ -13,9 +13,10 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const STYLE: &str = "<style>html{font-family: ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji'}</style>";
 
@@ -128,52 +129,59 @@ pub async fn handle_auth(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    // Spawn the server in a separate task
+    // Spawn the server with graceful shutdown
+    let shutdown_ct = CancellationToken::new();
+    let server_shutdown = shutdown_ct.clone();
     let server_handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
+            .await;
     });
 
-    // Open the browser with the auth URL
-    debug!("Opening browser with URL: {}", auth_url);
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(auth_url).spawn()?;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("cmd")
-            .args(["/C", "start", auth_url])
-            .spawn()?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        Command::new("xdg-open").arg(auth_url).spawn()?;
-    }
-
-    // Wait for auth to complete or timeout
-    debug!("Waiting for OAuth callback...");
-    let timeout_duration = Duration::from_secs(DEFAULT_COORDINATION_TIMEOUT * 2);
-
-    let result = match tokio::time::timeout(timeout_duration, auth_done_rx.recv()).await {
-        Ok(Some(auth_config)) => {
-            debug!("Auth completed successfully");
-            Ok(auth_config)
+    let result = async {
+        // Open the browser with the auth URL
+        debug!("Opening browser with URL: {}", auth_url);
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open").arg(auth_url).spawn()?;
         }
-        Ok(None) => {
-            error!("Auth failed - channel closed");
-            Err(CoordinationError::Other(
-                "Auth channel closed unexpectedly".to_string(),
-            ))
+        #[cfg(target_os = "windows")]
+        {
+            Command::new("cmd")
+                .args(["/C", "start", auth_url])
+                .spawn()?;
         }
-        Err(_) => {
-            error!("Auth timed out");
-            Err(CoordinationError::Timeout)
+        #[cfg(target_os = "linux")]
+        {
+            Command::new("xdg-open").arg(auth_url).spawn()?;
         }
-    };
-    // Give some time for the server to shut down
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    server_handle.abort();
+        // Wait for auth to complete or timeout
+        debug!("Waiting for OAuth callback...");
+        let timeout_duration = Duration::from_secs(DEFAULT_COORDINATION_TIMEOUT * 2);
+
+        match tokio::time::timeout(timeout_duration, auth_done_rx.recv()).await {
+            Ok(Some(auth_config)) => {
+                debug!("Auth completed successfully");
+                Ok(auth_config)
+            }
+            Ok(None) => {
+                error!("Auth failed - channel closed");
+                Err(CoordinationError::Other(
+                    "Auth channel closed unexpectedly".to_string(),
+                ))
+            }
+            Err(_) => {
+                error!("Auth timed out");
+                Err(CoordinationError::Timeout)
+            }
+        }
+    }
+    .await;
+
+    // Always shut down the OAuth server, even on error
+    shutdown_ct.cancel();
+    let _ = server_handle.await;
 
     result
 }
@@ -183,55 +191,57 @@ pub async fn wait_for_auth(
     lock_file: &LockFile,
 ) -> Result<AuthConfig, CoordinationError> {
     let server_url_hash = auth_client.get_server_url_hash();
-
-    // Check if the lock is still valid
     let config_manager = ConfigManager::new();
-    match config_manager.read_lock_file(server_url_hash) {
-        Ok(current_lock) => {
-            if current_lock.pid != lock_file.pid || is_lock_expired(&current_lock) {
-                debug!("Lock changed or expired, retrying with our own auth");
-                return Err(CoordinationError::Other(
-                    "Lock changed or expired".to_string(),
-                ));
+    let timeout_duration = Duration::from_secs(DEFAULT_COORDINATION_TIMEOUT * 2);
+    let poll_interval = Duration::from_secs(1);
+    let start = tokio::time::Instant::now();
+
+    loop {
+        // Check if the lock is still valid
+        match config_manager.read_lock_file(server_url_hash) {
+            Ok(current_lock) => {
+                if current_lock.pid != lock_file.pid || is_lock_expired(&current_lock) {
+                    debug!("Lock changed or expired, retrying with our own auth");
+                    return Err(CoordinationError::Other(
+                        "Lock changed or expired".to_string(),
+                    ));
+                }
+            }
+            Err(ConfigError::NotFound) => {
+                debug!("Lock file removed, auth may be complete");
+            }
+            Err(e) => {
+                error!("Error reading lock file: {}", e);
+                return Err(e.into());
             }
         }
-        Err(ConfigError::NotFound) => {
-            debug!("Lock file removed, auth may be complete");
-            // Fall through to check auth config
-        }
-        Err(e) => {
-            error!("Error reading lock file: {}", e);
-            return Err(e.into());
-        }
-    }
 
-    // Try to get the auth config
-    match auth_client.get_auth_config().await {
-        Ok(config) => {
-            debug!("Auth complete, found valid config");
-            return Ok(config);
+        // Try to get the auth config
+        match auth_client.get_auth_config().await {
+            Ok(config) => {
+                debug!("Auth complete, found valid config");
+                return Ok(config);
+            }
+            Err(AuthError::AuthRequired) => {
+                debug!("Still waiting for auth to complete");
+            }
+            Err(e) => {
+                error!("Error getting auth config: {}", e);
+                return Err(e.into());
+            }
         }
-        Err(AuthError::AuthRequired) => {
-            debug!("Still waiting for auth to complete");
-        }
-        Err(e) => {
-            error!("Error getting auth config: {}", e);
-            return Err(e.into());
-        }
-    }
 
-    error!("Timed out waiting for auth");
-    Err(CoordinationError::Timeout)
+        if start.elapsed() >= timeout_duration {
+            error!("Timed out waiting for auth");
+            return Err(CoordinationError::Timeout);
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 fn is_lock_expired(lock: &LockFile) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Lock expires after 10 minutes
-    now > lock.created_at + 600
+    crate::utils::is_lock_expired(lock)
 }
 
 // OAuth callback handler

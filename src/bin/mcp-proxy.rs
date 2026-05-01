@@ -15,7 +15,6 @@ use rmcp_proxy::{
 };
 use std::{
     collections::HashMap, env, error::Error, net::SocketAddr, path::PathBuf, process,
-    time::Duration,
 };
 use tracing::{debug, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -219,7 +218,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .parse::<SocketAddr>()?,
                     unix_socket: cli.unix_socket.clone(),
                     unix_socket_mode,
-                    keep_alive: Some(Duration::from_secs(15)),
+                    keep_alive: Some(rmcp_proxy::utils::SSE_KEEP_ALIVE),
                 };
 
                 // Run SSE server
@@ -241,7 +240,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .parse::<SocketAddr>()?,
                     unix_socket: cli.unix_socket.clone(),
                     unix_socket_mode,
-                    keep_alive: Some(Duration::from_secs(15)),
+                    keep_alive: Some(rmcp_proxy::utils::SSE_KEEP_ALIVE),
                 };
 
                 // Run Streamable HTTP server
